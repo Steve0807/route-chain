@@ -272,10 +272,61 @@ static inline bool is_ipv4_ttl_exceeded(struct pkt* pkt, uint32_t base_addr, uin
 
 static inline bool is_ipv6_ttl_exceeded(struct pkt* pkt, struct in6_addr* base_addr, struct in6_addr* timeout_addr) {
     memcpy(timeout_addr, base_addr, IPV6_ADDR_LEN);
-    timeout_addr->s6_addr32[3] = htonl(ntohl(timeout_addr->s6_addr32[3]) + pkt->ipv6_hdr.ip6_hlim);
+    
+    uint32_t ttl_offset = pkt->ipv6_hdr.ip6_hlim;
+    
+    uint64_t last_part = ntohl(timeout_addr->s6_addr32[3]);
+    last_part += ttl_offset;
+    
+    uint64_t carry = last_part >> 32;
+    timeout_addr->s6_addr32[3] = htonl(last_part & 0xFFFFFFFF);
+    
+    if (carry > 0) {
+        uint64_t third_part = ntohl(timeout_addr->s6_addr32[2]);
+        third_part += carry;
+        carry = third_part >> 32;
+        timeout_addr->s6_addr32[2] = htonl(third_part & 0xFFFFFFFF);
+        
+        if (carry > 0) {
+            uint64_t second_part = ntohl(timeout_addr->s6_addr32[1]);
+            second_part += carry;
+            carry = second_part >> 32;
+            timeout_addr->s6_addr32[1] = htonl(second_part & 0xFFFFFFFF);
+            
+            if (carry > 0) {
+                uint64_t first_part = ntohl(timeout_addr->s6_addr32[0]);
+                first_part += carry;
+                timeout_addr->s6_addr32[0] = htonl(first_part & 0xFFFFFFFF);
+            }
+        }
+    }
 
-    return !(ntohl(base_addr->s6_addr32[3]) <= ntohl(pkt->ipv6_hdr.ip6_dst.s6_addr32[3])
-             && ntohl(base_addr->s6_addr32[3]) + pkt->ipv6_hdr.ip6_hlim >= ntohl(pkt->ipv6_hdr.ip6_dst.s6_addr32[3]));
+    bool in_range = true;
+    
+    for (int i = 0; i < 3; i++) {
+        uint32_t base = ntohl(base_addr->s6_addr32[i]);
+        uint32_t dest = ntohl(pkt->ipv6_hdr.ip6_dst.s6_addr32[i]);
+        uint32_t timeout = ntohl(timeout_addr->s6_addr32[i]);
+        
+        if (base != dest || timeout != dest) {
+            if (base > dest || timeout < dest) {
+                in_range = false;
+                break;
+            } else if (base < dest && timeout > dest) {
+                break;
+            }
+        }
+    }
+    
+    if (in_range) {
+        uint32_t base = ntohl(base_addr->s6_addr32[3]);
+        uint32_t dest = ntohl(pkt->ipv6_hdr.ip6_dst.s6_addr32[3]);
+        uint32_t timeout = ntohl(timeout_addr->s6_addr32[3]);
+        
+        in_range = (base <= dest && timeout >= dest);
+    }
+    
+    return !in_range;
 }
 
 static inline void reply_icmp_ping(struct pkt* pkt, uint32_t pkt_len, int fd) {
