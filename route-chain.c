@@ -213,52 +213,31 @@ static inline bool find_matching_ipv6_block(struct pkt* pkt, struct in6_addr* ad
     for (uint32_t i = 0; i < ip_blks_len; i++) {
         if (ip_blks[i].af != AF_INET6) continue;
 
-        uint32_t masked_daddr;
-        uint32_t masked_ipblk;
-
-        if (ip_blks[i].prefix_len <= 32) {
-            masked_daddr = ntohl(pkt->ipv6_hdr.ip6_dst.s6_addr32[0]) & (0xffffffff << (32 - ip_blks[i].prefix_len));
-            masked_ipblk = ntohl(ip_blks[i].addr_v6[0]) & (0xffffffff << (32 - ip_blks[i].prefix_len));
-            if (masked_daddr != masked_ipblk) continue;
-        } else {
-            masked_daddr = pkt->ipv6_hdr.ip6_dst.s6_addr32[0];
-            masked_ipblk = ip_blks[i].addr_v6[0];
-            if (masked_daddr != masked_ipblk) continue;
+        struct in6_addr mask;
+        memset(&mask, 0, sizeof(struct in6_addr));
+        
+        int full_bytes = ip_blks[i].prefix_len / 8;
+        int rem_bits = ip_blks[i].prefix_len % 8;
+        
+        memset(&mask, 0xff, full_bytes);
+        
+        if (rem_bits > 0 && full_bytes < 16) {
+            mask.s6_addr[full_bytes] = 0xff << (8 - rem_bits);
         }
-
-        if (ip_blks[i].prefix_len > 32) {
-            if (ip_blks[i].prefix_len <= 64) {
-                masked_daddr = ntohl(pkt->ipv6_hdr.ip6_dst.s6_addr32[1]) & (0xffffffff << (64 - ip_blks[i].prefix_len));
-                masked_ipblk = ntohl(ip_blks[i].addr_v6[1]) & (0xffffffff << (64 - ip_blks[i].prefix_len));
-                if (masked_daddr != masked_ipblk) continue;
-            } else {
-                masked_daddr = pkt->ipv6_hdr.ip6_dst.s6_addr32[1];
-                masked_ipblk = ip_blks[i].addr_v6[1];
-                if (masked_daddr != masked_ipblk) continue;
+        
+        bool match = true;
+        for (int j = 0; j < 16; j++) {
+            if ((pkt->ipv6_hdr.ip6_dst.s6_addr[j] & mask.s6_addr[j]) != 
+                (ip_blks[i].addr[j] & mask.s6_addr[j])) {
+                match = false;
+                break;
             }
         }
-
-        if (ip_blks[i].prefix_len > 64) {
-            if (ip_blks[i].prefix_len <= 96) {
-                masked_daddr = ntohl(pkt->ipv6_hdr.ip6_dst.s6_addr32[2]) & (0xffffffff << (96 - ip_blks[i].prefix_len));
-                masked_ipblk = ntohl(ip_blks[i].addr_v6[2]) & (0xffffffff << (96 - ip_blks[i].prefix_len));
-                if (masked_daddr != masked_ipblk) continue;
-
-            } else {
-                masked_daddr = ntohl(pkt->ipv6_hdr.ip6_dst.s6_addr32[2]);
-                masked_ipblk = ntohl(ip_blks[i].addr_v6[2]);
-                if (masked_daddr != masked_ipblk) continue;
-
-                masked_daddr
-                    = ntohl(pkt->ipv6_hdr.ip6_dst.s6_addr32[3]) & (0xffffffff << (128 - ip_blks[i].prefix_len));
-                masked_ipblk = ntohl(ip_blks[i].addr_v6[3]) & (0xffffffff << (128 - ip_blks[i].prefix_len));
-                if (masked_daddr != masked_ipblk) continue;
-            }
+        
+        if (match) {
+            memcpy(addr, ip_blks[i].addr, IPV6_ADDR_LEN);
+            return true;
         }
-
-        /* Adding to higher digits is not implemented, but unlikely necessary anyway */
-        memcpy(addr, ip_blks[i].addr, IPV6_ADDR_LEN);
-        return true;
     }
     return false;
 }
@@ -271,62 +250,50 @@ static inline bool is_ipv4_ttl_exceeded(struct pkt* pkt, uint32_t base_addr, uin
 }
 
 static inline bool is_ipv6_ttl_exceeded(struct pkt* pkt, struct in6_addr* base_addr, struct in6_addr* timeout_addr) {
+
+    memset(timeout_addr, 0, sizeof(struct in6_addr));
+    
     memcpy(timeout_addr, base_addr, IPV6_ADDR_LEN);
     
-    uint32_t ttl_offset = pkt->ipv6_hdr.ip6_hlim;
+    uint16_t hop_id = pkt->ipv6_hdr.ip6_hlim;
     
-    uint64_t last_part = ntohl(timeout_addr->s6_addr32[3]);
-    last_part += ttl_offset;
+    timeout_addr->s6_addr[14] = (hop_id & 0xFF00) >> 8; 
+    timeout_addr->s6_addr[15] = hop_id & 0xFF;
     
-    uint64_t carry = last_part >> 32;
-    timeout_addr->s6_addr32[3] = htonl(last_part & 0xFFFFFFFF);
+    bool ttl_exceeded = true;
     
-    if (carry > 0) {
-        uint64_t third_part = ntohl(timeout_addr->s6_addr32[2]);
-        third_part += carry;
-        carry = third_part >> 32;
-        timeout_addr->s6_addr32[2] = htonl(third_part & 0xFFFFFFFF);
-        
-        if (carry > 0) {
-            uint64_t second_part = ntohl(timeout_addr->s6_addr32[1]);
-            second_part += carry;
-            carry = second_part >> 32;
-            timeout_addr->s6_addr32[1] = htonl(second_part & 0xFFFFFFFF);
-            
-            if (carry > 0) {
-                uint64_t first_part = ntohl(timeout_addr->s6_addr32[0]);
-                first_part += carry;
-                timeout_addr->s6_addr32[0] = htonl(first_part & 0xFFFFFFFF);
-            }
+    bool matches_dest = true;
+    for (int i = 0; i < 16; i++) {
+        if (pkt->ipv6_hdr.ip6_dst.s6_addr[i] != base_addr->s6_addr[i]) {
+            matches_dest = false;
+            break;
         }
     }
+    
+    if (matches_dest && pkt->ipv6_hdr.ip6_hlim > 0) {
+        ttl_exceeded = false;
+    }
+    
+    return ttl_exceeded;
+}
 
-    bool in_range = true;
-    
-    for (int i = 0; i < 3; i++) {
-        uint32_t base = ntohl(base_addr->s6_addr32[i]);
-        uint32_t dest = ntohl(pkt->ipv6_hdr.ip6_dst.s6_addr32[i]);
-        uint32_t timeout = ntohl(timeout_addr->s6_addr32[i]);
-        
-        if (base != dest || timeout != dest) {
-            if (base > dest || timeout < dest) {
-                in_range = false;
-                break;
-            } else if (base < dest && timeout > dest) {
-                break;
-            }
-        }
-    }
-    
-    if (in_range) {
-        uint32_t base = ntohl(base_addr->s6_addr32[3]);
-        uint32_t dest = ntohl(pkt->ipv6_hdr.ip6_dst.s6_addr32[3]);
-        uint32_t timeout = ntohl(timeout_addr->s6_addr32[3]);
-        
-        in_range = (base <= dest && timeout >= dest);
-    }
-    
-    return !in_range;
+static inline void reply_icmp6_ttl_exceeded(struct pkt* pkt, uint32_t pkt_len, int fd, struct in6_addr* timeout_addr) {
+    memset(&pkt->ipv6_padding, 0, 48);
+    pkt->ipv6_padding.ip6_flow = 0x60;
+    pkt->ipv6_padding.ip6_plen = htons(56);
+    pkt->ipv6_padding.ip6_nxt  = IPPROTO_ICMPV6;
+    pkt->ipv6_padding.ip6_hlim = REPLY_TTL;
+
+    memcpy(&pkt->ipv6_padding.ip6_src, timeout_addr, IPV6_ADDR_LEN);
+    memcpy(&pkt->ipv6_padding.ip6_dst, &pkt->ipv6_hdr.ip6_src, IPV6_ADDR_LEN);
+    pkt->icmp_padding.type = ICMP6_TIME_EXCEEDED;
+    pkt->icmp_padding.code = 0;
+
+    pkt->icmp_padding.checksum = 0;
+    pkt->icmp_padding.checksum = checksum_calc_ipv6_phdr(&pkt->ipv6_padding, &pkt->icmp_padding, 56);
+
+    pkt_len = 96;
+    if (pkt_len != write(fd, &pkt->ipv6_padding, pkt_len)) DIE();
 }
 
 static inline void reply_icmp_ping(struct pkt* pkt, uint32_t pkt_len, int fd) {
